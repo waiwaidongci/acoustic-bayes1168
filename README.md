@@ -53,7 +53,7 @@ JWT有效期8小时；PBKDF2盐化哈希保存密码；角色每请求从数据�
 
 ## 实体与字段
 
-AcousticBatch / AcousticSample / ClassifierRun / InspectionNote 是核心实体；另有User和Audit。数据库实际表：`acoustic_batches` → `acoustic_samples` → `classifier_runs` → `inspection_notes`。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：均方根振幅（`rms`）、频谱质心 Hz（`centroid`）、峭度（`kurtosis`）、复核类型（`label`）。
+AcousticBatch / AcousticSample / ClassifierRun / InspectionNote 是核心实体，另有 User、Audit 与零偏偏移研究 OffsetStudy。数据库实际表：`acoustic_batches` → `acoustic_samples` → `classifier_runs` → `inspection_notes`；零偏研究挂在 `classifier_runs` 上，表为 `offset_studies`（分片计划与分片记账以 JSON 保存，分段事件落 artifacts 卷）。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：均方根振幅（`rms`）、频谱质心 Hz（`centroid`）、峭度（`kurtosis`）、复核类型（`label`）。
 
 实体贯穿 `backend/src/models`、`schemas`、`services`、`controllers`、`routes`，以及 `frontend/src/api/research.js`、`stores/research.js` 和 `pages`。`Source.key` 与 `(Record.source_id, reference)` 为自然键；来源改名不会修改已冻结任务输入。业务说明在创建时保存结果快照，批准后从该快照导出。
 
@@ -65,6 +65,17 @@ GaussianNB与分层交叉验证、混淆矩阵和后验解释，全部计算位�
 - `smoothing`：方差平滑系数，默认 `1e-09`。
 
 分层交叉验证，每折只在训练行拟合均值与方差；后验概率是模型分布，不是检修结论。
+
+### 零偏偏移区间分析（offset study）
+
+声检仪读数存在零偏时，需要量化“检修量会差多少”。该分析挂在一条**已完成**的 ClassifierRun 上，冻结其交叉验证各折模型与全部样本，仅对**同批验证样本（折外行）**的频谱质心 `centroid` 加同一个偏移 `o`，其余特征与训练折不变，回答“指定故障判读数在偏移区间内的精确上下限及达到它们的偏移”。
+
+- 入参：`offset_min`/`offset_max`（Hz，闭区间）、`target_label`（目标故障判读）、`shard_size`（单片样本数，1–100000，默认1000）。
+- 不枚举偏移、不对每个偏移重判整批：两类联合对数后验之差在标准化位移 `t=o/scale_c` 上是二次函数，每条验证样本只算一次全部临界偏移，产出“目标判读”的分段指示（单点段区分临界并列点，开区间段覆盖稳定判读），见 `backend/src/services/offset_math.py`。
+- 有限内存分批：验证样本按 `shard_size` 切片，逐片原子落盘到 `ARTIFACT_DIR/offset-study-<id>/shard-*.segments` 并在 `offset_studies.shard_status` 记账（含输入校验和）。中断重启后已完成片按校验和跳过，重试不重复纳入；口径变化时整研究作废旧片。
+- 跨片归并：全部片算齐后用 `heapq.merge` 对有序分段做线性多路归并，**同一偏移的跨片变化先合并**，再扫描求判读数 `N(o)` 的精确最小/最大值与全部对应偏移（区间端点、并列判读按“闭区间、argmax 并列取编号最小类”口径单独刻画）。
+- 页面口径：分片未全部完成时只显示进度（`shard_done/shard_total`），**全批算齐才显示数量上下限与达到它们的偏移**；历史研究读取口径不变。
+- 独立队列 `offset:queue`，由同一 worker 与 `analysis:queue` 一起 `BLPOP` 消费；失败保留错误态，可修正后重新发起。独立 oracle 对照与十万样本性能/恢复测试在 `backend/tests/`。
 
 失败态：业务字段缺失/非有限数值、参数越界、样本不足、退化特征或结构错误均明确拒绝或将任务标failed，错误消息保存在任务中。可回到来源或配置修正后重新执行，历史失败记录保留。
 
@@ -90,7 +101,10 @@ frontend/src/api, stores, types, components/common, hooks, pages, router, utils,
 backend/src/routes, controllers, services, models, schemas, middlewares, utils, constants, config
 backend/scripts/seed_demo.py
 backend/migrations/001_initial.sql
+backend/tests/test_offset_math.py, test_offset_pipeline.py
 ```
+
+零偏分析测试不依赖 MySQL/Redis，在 backend 目录用本地虚拟环境即可运行：`python -m tests.test_offset_math`（事件分段 vs 密集网格暴力重判的独立 oracle，含端点、单点区间、并列判读、单片/极细分片）与 `python -m tests.test_offset_pipeline`（分片幂等、中断恢复、十万样本性能与单片内存上限）。
 
 本地后端：Python3.11虚拟环境安装 `backend/requirements.txt`，设置 `DATABASE_URL`、`REDIS_URL`、`ARTIFACT_DIR`，在backend目录运行 `uvicorn src.main:app --reload`；另开终端运行 `python -m src.worker`。原生前端无需编译，推荐以Compose Nginx访问，保证 `/api/` 代理。前端为Google Fonts双字体、oklch色板，离线字体回退serif；1280/768/390响应布局。
 

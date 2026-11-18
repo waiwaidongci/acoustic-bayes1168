@@ -8,6 +8,7 @@ from .models import source,record,user,note,audit
 from .services.algorithm import calculate
 from .services.audit import log
 from .services.export import csv_response
+from .services.offset_studies import run_study
 queue=Redis.from_url(REDIS_URL)
 ARTIFACT_DIR.mkdir(parents=True,exist_ok=True)
 def execute(id):
@@ -29,6 +30,13 @@ def execute(id):
 def main():
     while True:
         (ARTIFACT_DIR/'heartbeat').write_text(str(time.time()))
-        value=queue.blpop('analysis:queue',timeout=2)
-        if value:execute(int(value[1]))
+        # 同时消费常规分析与零偏偏移研究两个队列；分片可恢复，崩溃后重启即续跑
+        value=queue.blpop(['analysis:queue','offset:queue'],timeout=2)
+        if not value:continue
+        key_name,item=value
+        item_id=int(item)
+        if key_name=='offset:queue':
+            run_study(item_id)
+        else:
+            execute(item_id)
 if __name__=='__main__':main()
